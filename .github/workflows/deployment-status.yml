@@ -74,7 +74,7 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const core = require('@actions/core');
+            const core = require('@actions/core';
             const issueNumber = '${{ steps.create-issue.outputs.issue_number }}';
             const currentSha = '${{ github.sha }}';
             const previousSha = '${{ steps.capture.outputs.previous_sha }}';
@@ -109,7 +109,7 @@ jobs:
     env:
       ISSUE_NUMBER: ${{ needs.pre-deployment.outputs.issue_number }}
       CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_sha }}
-      PREVIOUS_SHA: ${{ needs.pre-deployment.outputs.previous_sha }}
+      PREVIOUSSHA: ${{ needs.pre-deployment.outputs.previous_sha }}
       PKG_VERSION: ${{ needs.pre-deployment.outputs.pkg_version }}
       ARTIFACT_CHECKSUM: ${{ steps.checksum.outputs.checksum }}
     steps:
@@ -146,7 +146,6 @@ jobs:
           cat > rollback/scripts/rollback.sh <<'HEREDOC_ROLLBACK'
           #!/bin/bash
           set -euo pipefail
-          set -euo pipefail
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           ARTIFACT="${1:-rollback-package.tar.gz}"
           WORK_DIR="$(mktemp -d)"
@@ -179,7 +178,7 @@ jobs:
           restore_dependencies() { if ! npm ci; error "npm ci failed"; }
           validate_script() {
             local script="${WORK_DIR}/extract/scripts/rollback.sh"
-            if [[ -f "${script}" ]]; then bash -n "${script}" || error "Rollback script syntax check failed";
+            if [[ -f "${script}" ]; then bash -n "${script}" || error "Rollback script syntax check failed";
             else error "Rollback script not found in artifact"; fi
           }
           main() {
@@ -205,8 +204,8 @@ jobs:
           log "Package version: ${PKG_VERSION}"
           if ! node -e '
             const fs = require("fs");
-            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8");
-            const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
             const pkgDeps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
             const lockDeps = lock.dependencies || {};
             const missing = Object.keys(pkgDeps).filter(dep => !(dep in lockDeps));
@@ -246,7 +245,7 @@ jobs:
           5. **Restore environment variables** — set NODE_ENV and PORT in `.env` from the environment template.
           6. **Restore dependencies** — run `npm ci` to reinstall the exact dependency versions.
           7. **Validate the rollback script** — run `bash -n rollback/scripts/rollback.sh`.
-          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz.
+          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz`.
           9. **Restart the application** — run `npm start`.
           10. **Verify the deployment** — call `curl -f http://localhost:3000/health` and confirm a 200 response.
           ## Quick Rollback Command
@@ -439,6 +438,6 @@ jobs:
                 body: body,
               });
               core.info(`Final comment posted on issue #${issueNumber}`);
-            } catch (error) {
-              core.setFailed(`Failed to post final comment: ${error.message}`);
+            } catch (error)
+          core.setFailed(`Failed to post final comment: ${error.message}`);
             }
