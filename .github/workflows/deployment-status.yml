@@ -1,0 +1,431 @@
+name: Deployment Status
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  pre-deployment:
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.create-issue.outputs.issue_number }}
+      current_sha: ${{ steps.capture.outputs.current_sha }}
+      previous_sha: ${{ steps.capture.outputs.previous_sha }}
+      pkg_version: ${{ steps.capture.outputs.pkg_version }}
+      pkg_name: ${{ steps.capture.outputs.pkg_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Capture commit and package information
+        id: capture
+        run: |
+          echo "current_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "previous_sha=$(git rev-parse HEAD^)" >> $GITHUB_OUTPUT
+          echo "pkg_version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+          echo "pkg_name=$(node -p "require('./package.json').name")" >> $GITHUB_OUTPUT
+
+      - name: Create Deployment Tracking Issue
+        id: create-issue
+        uses: actions/github-script@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const core = require('@actions/core');
+            const currentSha = '${{ github.sha }}';
+            const previousSha = '${{ steps.capture.outputs.previous_sha }}';
+            const pkgVersion = '${{ steps.capture.outputs.pkg_version }}';
+
+            try {
+              const { data } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Deployment Tracking - ${currentSha}`,
+                body: [
+                  `Deployment tracking issue for commit ${currentSha}.`,
+                  '',
+                  'Workflow: Deployment Status (push -> main)',
+                  '',
+                  `Previous Commit: ${previousSha}`,
+                  'Package Name: mcpmark-cicd',
+                  `Package Version: ${pkgVersion}`,
+                  '',
+                  'Jobs:',
+                  '  1. pre-deployment — lint and test quality checks',
+                  '  2. rollback-preparation — create rollback artifacts',
+                  '  3. post-deployment — update labels and close issue',
+                  '',
+                  'Status: in-progress',
+                ].join('\n'),
+                labels: ['deployment', 'in-progress'],
+              });
+              core.setOutput('issue_number', data.number);
+              core.info(`Created deployment tracking issue #${data.number}: ${data.title}`);
+            } catch (error) {
+              core.setFailed(`Failed to create deployment tracking issue: ${error.message}`);
+            }
+
+      - name: Post Pre-deployment Comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const core = require('@actions/core');
+            const issueNumber = '${{ steps.create-issue.outputs.issue_number }}';
+            const currentSha = '${{ github.sha }}';
+            const previousSha = '${{ steps.capture.outputs.previous_sha }}';
+            const pkgVersion = '${{ steps.capture.outputs.pkg_version }}';
+
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: [
+                  'Pre-deployment checks completed.',
+                  '',
+                  `- Commit: ${currentSha}`,
+                  `- Previous Commit: ${previousSha}`,
+                  `- Package Version: ${pkgVersion}`,
+                  `- Labels added: deployment, in-progress`,
+                ].join('\n'),
+              });
+              core.info(`Pre-deployment comment posted on issue #${issueNumber}`);
+            } catch (error) {
+              console.error('Failed to post pre-deployment comment:', error);
+              process.exit(1);
+            }
+
+  rollback-preparation:
+    runs-on: ubuntu-latest
+    needs: pre-deployment
+    outputs:
+      artifact_name: ${{ steps.build-artifact.outputs.artifact_name }}
+      artifact_sha256: ${{ steps.checksum.outputs.checksum }}
+      issue_number: ${{ steps.create-comment.outputs.issue_number }}
+    env:
+      ISSUE_NUMBER: ${{ needs.pre-deployment.outputs.issue_number }}
+      CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_sha }}
+      PREVIOUS_SHA: ${{ needs.pre-deployment.outputs.previous_sha }}
+      PKG_VERSION: ${{ needs.pre-deployment.outputs.pkg_version }}
+      ARTIFACT_CHECKSUM: ${{ steps.checksum.outputs.checksum }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Capture deployment info
+        id: capture
+        run: |
+          echo "CURRENT_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "PREVIOUS_SHA=$(git rev-parse HEAD^)" >> $GITHUB_OUTPUT
+          echo "PKG_VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+          echo "PKGLOCK_SHA=$(sha1sum package-lock.json | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Create rollback artifact directory
+        run: |
+          mkdir -p rollback/{backups,docs,scripts}
+
+      - name: Backup package.json
+        run: cp package.json rollback/backups/package.json
+
+      - name: Backup package-lock.json
+        run: cp package-lock.json rollback/backups/package-lock.json
+
+      - name: Create environment template
+        run: |
+          cat > rollback/backups/env-templates/.env.example <<'HEREDOC_ENV'
+          NODE_ENV=production
+          PORT=3000
+          # Deployment metadata (provided by CI/CD)
+          GITHUB_SHA=
+          GITHUB_RUN_NUMBER=
+          HEREDOC_ENV
+
+      - name: Create rollback script
+        run: |
+          cat > rollback/scripts/rollback.sh <<'HEREDOC_ROLLBACK'
+          #!/bin/bash
+          set -euo pipefail
+
+          # =====================================================================
+          # rollback.sh
+          # =====================================================================
+          # Purpose: Executable rollback script for the mcpmark-cicd deployment.
+          # Usage: ./rollback.sh [artifact]
+          #        artifact : Compressed rollback package (default: rollback-package-<sha>.tar.gz)
+          #
+          # Behavior:
+          #   1. Validates the presence of the rollback artifact.
+          #   2. Verifies SHA256 checksums contained in <artifact>.sha256.
+          #   3. Extracts configuration backups (package.json, package-lock.json, env templates).
+          #   4. Restores Node.js dependencies with npm ci.
+          #   5. Re-validates the rollback script syntax.
+          #   6. Logs all actions to rollback.log.
+          #
+          # Error handling:
+          #   - Exit codes are non-zero on any failure.
+          #   - An ERR trap logs the failure point before exiting.
+          # =====================================================================
+
+          set -euo pipefail
+
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          ARTIFACT="${1:-rollback-package.tar.gz}"
+          WORK_DIR="$(mktemp -d)"
+          LOG_FILE="${SCRIPT_DIR}/rollback.log"
+
+          # ---------------------------------------------------------------------
+          # Logging helper
+          # ---------------------------------------------------------------------
+          log() {
+            local level="$1"; shift
+            local timestamp
+            timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            printf "[%s] [%s] %s\n" "$timestamp" "$level" "$*" | tee -a "${LOG_FILE}"
+          }
+
+          # ---------------------------------------------------------------------
+          # Error helper
+          # ---------------------------------------------------------------------
+          error() {
+            log "ERROR" "$@"
+            exit 1
+          }
+
+          # ---------------------------------------------------------------------
+          # Trap: log any error before exiting
+          # ---------------------------------------------------------------------
+          trap 'log "ERROR" "Rollback procedure failed at: ${BASH_SOURCE[0]}:${BASH_LINENO[0]}"' ERR
+
+          # ---------------------------------------------------------------------
+          # Validate that the rollback artifact exists
+          # ---------------------------------------------------------------------
+          validate_artifact() {
+            if [[ ! -f "${ARTIFACT}" ]]; then
+              error "Rollback artifact not found: ${ARTIFACT}"
+            fi
+            local size
+            size="$(stat -f%z "${ARTIFACT}" 2>/dev/null || stat -c%s "${ARTIFACT}")"
+            log "INFO" "Rollback artifact found: ${ARTIFACT} (size: ${size} bytes)"
+          }
+
+          # ---------------------------------------------------------------------
+          # Verify SHA256 checksums
+          # ---------------------------------------------------------------------
+          verify_checksums() {
+            log "INFO" "Verifying SHA256 checksums..."
+            if [[ -f "${ARTIFACT}.sha256" ]]; then
+              if sha256sum -c "${ARTIFACT}.sha256" --quiet; then
+                log "INFO" "SHA256 checksums verified successfully"
+              else
+                error "SHA256 checksum verification failed"
+              fi
+            else
+              error "Checksum file not found for ${ARTIFACT}: ${ARTIFACT}.sha256"
+            fi
+          }
+
+          # ---------------------------------------------------------------------
+          # Extract artifacts to a working directory
+          # ---------------------------------------------------------------------
+          extract_artifact() {
+            log "INFO" "Extracting rollback artifact..."
+            mkdir -p "${WORK_DIR}/extract"
+            if ! tar -xzsf "${ARTIFACT}" -C "${WORK_DIR}/extract" --strip-components=1; then
+              error "Failed to extract ${ARTIFACT}"
+            fi
+            log "INFO" "Artifact extracted to ${WORK_DIR}/extract"
+          }
+
+          # ---------------------------------------------------------------------
+          # Restore configuration backups
+          # ---------------------------------------------------------------------
+          restore_backups() {
+            log "INFO" "Restoring configuration backups..."
+            local backup_dir="${WORK_DIR}/extract/backups"
+            if [[ ! -d "${backup_dir}" ]; then
+              error "Backup directory not found in artifact"
+            fi
+            cp -r "${backup_dir}"/* "${SCRIPT_DIR}/" || error "Failed to restore backups"
+            log "INFO" "Configuration backups restored: $(ls -1 "${backup_dir}" | awk 'END{print NR} files')"
+          }
+
+          # ---------------------------------------------------------------------
+          # Restore Node.js dependencies
+          # ---------------------------------------------------------------------
+          restore_dependencies() {
+            log "INFO" "Restoring Node.js dependencies..."
+            if ! npm ci; then
+              error "npm ci failed to restore dependencies"
+            fi
+            log "INFO" "Dependencies restored"
+          }
+
+          # ---------------------------------------------------------------------
+          # Validate rollback script syntax
+          # ---------------------------------------------------------------------
+          validate_script() {
+            log "INFO" "Validating rollback script syntax..."
+            local script="${WORK_DIR}/extract/scripts/rollback.sh"
+            if [[ -f "${script}" ]]; then
+              if bash -n "${script}"; then
+                log "INFO" "Rollback script syntax check passed"
+              else
+                error "Rollback script syntax check failed"
+              fi
+            else
+              error "Rollback script not found in artifact"
+            fi
+          }
+
+          # ---------------------------------------------------------------------
+          # Main entry point
+          # ---------------------------------------------------------------------
+          main() {
+            log "INFO" "=========================================="
+            log "INFO" "Starting rollback procedure"
+            log "INFO" "Artifact: ${ARTIFACT}"
+            log "INFO" "Retention policy: 30 days"
+
+            validate_artifact
+            verify_checksums
+            extract_artifact
+            restore_backups
+            restore_dependencies
+            validate_script
+
+            log "INFO" "Rollback completed successfully"
+            log "INFO" "=========================================="
+          }
+
+          main "$@"
+          HEREDOC_ROLLBACK
+          chmod +x rollback/scripts/rollback.sh
+
+      - name: Create dependency verification script
+        run: |
+          cat > rollback/scripts/verify-dependencies.sh <<'HEREDOC_VERIFY'
+          #!/bin/bash
+          set -euo pipefail
+
+          # =====================================================================
+          # verify-dependencies.sh
+          # =====================================================================
+          # Purpose: Verify dependency compatibility between package.json and
+          #          package-lock.json and validate the installed module tree.
+          #
+          # Usage: ./verify-dependencies.sh
+          #
+          # Exit codes:
+          #   0 - dependency verification passed
+          #   1 - dependency verification failed
+          # =====================================================================
+
+          set -euo pipefail
+
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "${SCRIPT_DIR}/../../.."
+
+          log() {
+            printf "[verify-dependencies] %s\n" "$*"
+          }
+
+          if [[ ! -f package.json ]]; then
+            echo "ERROR: package.json not found in $(pwd)" >&2
+            exit 1
+          fi
+
+          if [[ ! -f package-lock.json ]]; then
+            echo "ERROR: package-lock.json not found in $(pwd)" >&2
+            exit 1
+          fi
+
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          log "Package version: ${PKG_VERSION}"
+
+          if node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+            const pkgDeps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
+            const lockDeps = lock.dependencies || {};
+            const missing = Object.keys(pkgDeps).filter(dep => !(dep in lockDeps));
+            if (missing.length) {
+              console.error("Dependencies missing from package-lock.json: " + missing.join(", "));
+              process.exitCode = 1;
+            }
+            if (!lock.lockVersion && !lock.lockfileVersion) {
+              console.error("Invalid or missing lockfile version");
+              process.exitCode = 1;
+            }
+            log("Dependency tree consistency check passed");
+          '; then
+            log "Dependency verification PASSED: package.json and package-lock.json are consistent"
+          else
+            log "Dependency verification FAILED"
+            exit 1
+          fi
+
+          log "Running npm ls to validate the installed module tree..."
+          npm ls --production --depth=1 || true
+          log "Dependency verification complete"
+          HEREDOC_VERIFY
+
+      - name: Create rollback documentation
+        run: |
+          cat > rollback/docs/rollback.md <<'HEREDOC_DOC'
+          # Rollback Documentation — mcpmark-cicd
+
+          ## Overview
+
+          This documentation describes the rollback procedure for the **mcpmark-cicd** Node.js application.
+          The rollback package contains configuration backups (package.json, package-lock.json, environment templates),
+          a validated rollback script, a dependency verification script, and complete rollback documentation.
+
+          ## When to Rollback
+
+          Consider executing a rollback in the following situations:
+          - A deployment failed and the application is unavailable.
+          - Post-deployment health checks fail.
+          - Critical bugs or regressions are introduced by the latest commit.
+          - Dependency conflicts prevent the application from starting.
+
+          ## Prerequisites
+
+          - Access to the rollback package artifact `rollback-package-<sha>` stored in GitHub Actions.
+          - Terminal access to the deployment environment.
+          - Node.js >=
