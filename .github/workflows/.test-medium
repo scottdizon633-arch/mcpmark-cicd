@@ -1,0 +1,438 @@
+name: Deployment Status
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  pre-deployment:
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.create-issue.outputs.issue_number }}
+      current_sha: ${{ steps.capture.outputs.current_sha }}
+      previous_sha: ${{ steps.capture.outputs.previous_sha }}
+      pkg_version: ${{ steps.capture.outputs.pkg_version }}
+      pkg_name: ${{ steps.capture.outputs.pkg_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with: { node-version: ${{ env.NODE_VERSION }}, cache: npm }
+      - name: Install dependencies
+        run: npm ci
+      - name: Run lint
+        run: npm run lint
+      - name: Run tests
+        run: npm test
+      - name: Capture commit and package information
+        id: capture
+        run: |
+          echo "current_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "previous_sha=$(git rev-parse HEAD^)" >> $GITHUB_OUTPUT
+          echo "pkg_version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+          echo "pkg_name=$(node -p "require('./package.json').name")" >> $GITHUB_OUTPUT
+      - name: Create Deployment Tracking Issue
+        id: create-issue
+        uses: actions/github-script@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const core = require('@actions/core');
+            const currentSha = '${{ github.sha }}';
+            const previousSha = '${{ steps.capture.outputs.previous_sha }}';
+            const pkgVersion = '${{ steps.capture.outputs.pkg_version }}';
+            try {
+              const { data } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Deployment Tracking - ${currentSha}`,
+                body: [
+                  `Deployment tracking issue for commit ${currentSha}.`,
+                  '',
+                  `Previous Commit: ${previousSha}`,
+                  'Package Name: mcpmark-cicd',
+                  `Package Version: ${pkgVersion}`,
+                  '',
+                  'Jobs: pre-deployment -> rollback-preparation -> post-deployment',
+                  '',
+                  'Status: in-progress',
+                ].join('\n'),
+                labels: ['deployment', 'in-progress'],
+              });
+              core.setOutput('issue_number', data.number);
+            } catch (error) {
+              core.setFailed(`Failed to create deployment tracking issue: ${error.message}`);
+            }
+      - name: Post Pre-deployment Comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const core = require('@actions/core');
+            const issueNumber = '${{ steps.create-issue.outputs.issue_number }}';
+            const currentSha = '${{ github.sha }}';
+            const previousSha = '${{ steps.capture.outputs.previous_sha }}';
+            const pkgVersion = '${{ steps.capture.outputs.pkg_version }}';
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: [
+                  'Pre-deployment checks completed.',
+                  '',
+                  `- Commit: ${currentSha}`,
+                  `- Previous Commit: ${previousSha}`,
+                  `- Package Version: ${pkgVersion}`,
+                  `- Labels added: deployment, in-progress`,
+                ].join('\n'),
+              });
+              core.info(`Pre-deployment comment posted on issue #${issueNumber}`);
+            } catch (error) {
+              console.error('Failed to post pre-deployment comment:', error);
+              process.exit(1);
+            }
+  rollback-preparation:
+    runs-on: ubuntu-latest
+    needs: pre-deployment
+    outputs:
+      artifact_name: ${{ steps.build-artifact.outputs.artifact_name }}
+      artifact_sha256: ${{ steps.checksum.outputs.checksum }}
+      issue_number: ${{ steps.create-comment.outputs.issue_number }}
+    env:
+      ISSUE_NUMBER: ${{ needs.pre-deployment.outputs.issue_number }}
+      CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_sha }}
+      PREVIOUS_SHA: ${{ needs.pre-deployment.outputs.previous_sha }}
+      PKG_VERSION: ${{ needs.pre-deployment.outputs.pkg_version }}
+      ARTIFACT_CHECKSUM: ${{ steps.checksum.outputs.checksum }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with: { node-version: ${{ env.NODE_VERSION }}, cache: npm }
+      - name: Install dependencies
+        run: npm ci
+      - name: Capture deployment info
+        id: capture
+        run: |
+          echo "CURRENT_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "PREVIOUS_SHA=$(git rev-parse HEAD^)" >> $GITHUB_OUTPUT
+          echo "PKG_VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Create rollback artifact directory
+        run: mkdir -p rollback/{backups,docs,scripts}
+      - name: Backup package.json
+        run: cp package.json rollback/backups/package.json
+      - name: Backup package-lock.json
+        run: cp package-lock.json rollback/backups/package-lock.json
+      - name: Create environment template
+        run: |
+          cat > rollback/backups/env-templates/.env.example <<'HEREDOC_ENV'
+          NODE_ENV=production
+          PORT=3000
+          GITHUB_SHA=
+          GITHUB_RUN_NUMBER=
+          HEREDOC_ENV
+      - name: Create rollback script
+        run: |
+          cat > rollback/scripts/rollback.sh <<'HEREDOC_ROLLBACK'
+          #!/bin/bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          ARTIFACT="${1:-rollback-package.tar.gz}"
+          WORK_DIR="$(mktemp -d)"
+          LOG_FILE="${SCRIPT_DIR}/rollback.log"
+          log() { local level="$1"; shift; local t="$(date -u '+%Y-%m-%dT%H:%M:%SZ');"; printf "[%s] [%s] %s\n" t "$level" "$*" | tee -a "${LOG_FILE}"; }
+          error() { log "ERROR" "$@"; exit 1; }
+          trap 'log "ERROR" "Rollback failed at: ${BASH_SOURCE[0]}:${BASH_LINENO[0]}"' ERR
+          validate_artifact() { if [[ ! -f "${ARTIFACT}" ]]; then error "Rollback artifact not found: ${ARTIFACT}"; fi }
+          verify_checksums() {
+            log "INFO" "Verifying SHA256 checksums..."
+            if [[ -f "${ARTIFACT}.sha256" ]]; then
+              if sha256sum -c "${ARTIFACT}.sha256" --quiet; log "INFO" "SHA256 checksums verified"
+              else error "SHA256 checksum verification failed"; fi
+            else error "Checksum file not found: ${ARTIFACT}.sha256"; fi
+          }
+          extract_artifact() {
+            log "INFO" "Extracting rollback artifact..."
+            mkdir -p "${WORK_DIR}/extract"
+            if ! tar -xzsf "${ARTIFACT}" -C "${WORK_DIR}/extract" --strip-components=1; error "Failed to extract ${ARTIFACT}";
+            log "INFO" "Artifact extracted";
+          }
+          restore_backups() {
+            local backup_dir="${WORK_DIR}/extract/backups"
+            if [[ ! -d "${backup_dir}" ]; then error "Backup directory not found in artifact"; fi
+            cp -r "${backup_dir}"/* "${SCRIPT_DIR}/" || error "Failed to restore backups";
+          }
+          restore_dependencies() { if ! npm ci; error "npm ci failed"; }
+          validate_script() {
+            local script="${WORK_DIR}/extract/scripts/rollback.sh"
+            if [[ -f "${script}" ]; then bash -n "${script}" || error "Rollback script syntax check failed";
+            else error "Rollback script not found in artifact"; fi
+          }
+          main() {
+            log "INFO" "Starting rollback procedure"
+            validate_artifact; verify_checksums; extract_artifact; restore_backups; restore_dependencies; validate_script
+            log "INFO" "Rollback completed successfully"
+          }
+          main "$@"
+          HEREDOC_ROLLBACK
+          chmod +x rollback/scripts/rollback.sh
+      - name: Create dependency verification script
+        run: |
+          cat > rollback/scripts/verify-dependencies.sh <<'HEREDOC_VERIFY'
+          #!/bin/bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+          cd "${SCRIPT_DIR}/../../.."
+          log() { printf "[verify-dependencies] %s\n" "$*"; }
+          if [[ ! -f package.json || ! -f package-lock.json ]]; then
+            echo "ERROR: package.json/package-lock.json not found in $(pwd)" >&2; exit 1
+          fi
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          log "Package version: ${PKG_VERSION}
+          if ! node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8");
+            const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8");
+            const pkgDeps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
+            const lockDeps = lock.dependencies || {};
+            const missing = Object.keys(pkgDeps).filter(dep => !(dep in lockDeps));
+            if (missing.length) { console.error("Missing in lockfile: " + missing.join(", ")); process.exitCode = 1; }
+            if (!lock.lockVersion && !lock.lockfileVersion) { console.error("Invalid lockfile version"); process.exitCode = 1; }
+            console.log("Dependency tree consistency check passed");
+          '; then
+            log "Dependency verification FAILED"; exit 1
+          fi
+          log "Dependency verification PASSED"
+          log "Running npm ls to validate the installed module tree...
+          npm ls --production --depth=1 || true
+          log "Dependency verification complete"
+          HEREDOC_VERIFY
+      - name: Create rollback documentation
+        run: |
+          cat > rollback/docs/rollback.md <<'HEREDOC_DOC'
+          # Rollback Documentation — mcpmark-cicd
+          ## Overview
+          This document describes the rollback procedure for the mcpmark-cicd Node.js application.
+          The rollback package contains configuration backups, a validated rollback script,
+          a dependency verification script, and this documentation.
+          ## When to Rollback
+          - A deployment failed and the application is unavailable.
+          - Post-deployment health checks fail.
+          - Critical bugs or regressions are introduced by the latest commit.
+          - Dependency conflicts prevent the application from starting.
+          ## Prerequisites
+          - Access to the rollback package artifact `rollback-package-<sha>` in GitHub Actions.
+          - Terminal access to the deployment environment.
+          - Node.js >= 18.0.0 installed.
+          ## Step-by-Step Rollback Procedure
+          1. **Locate the rollback package** — download `rollback-package-<sha>` from GitHub Actions artifacts.
+          2. **Verify the checksum** — run `sha256sum -c rollback-package-<sha>.sha256.
+          3. **Extract the package** — run `tar -xzvf rollback-package-<sha>.tar.gz.
+          4. **Restore configuration backups** — copy `backups/package.json`, `backups/package-lock.json`, and `backups/env-templates/.env.example` into the application root.
+          5. **Restore environment variables** — set NODE_ENV and PORT in `.env` from the environment template.
+          6. **Restore dependencies** — run `npm ci` to reinstall the exact dependency versions.
+          7. **Validate the rollback script** — run `bash -n rollback/scripts/rollback.sh.
+          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz.
+          9. **Restart the application** — run `npm start.
+          10. **Verify the deployment** — call `curl -f http://localhost:3000/health` and confirm a 200 response.
+          ## Quick Rollback Command
+          ```bash
+          sha256sum -c rollback-package-<sha>.sha256
+          tar -xzvf rollback-package-<sha>.tar.gz
+          npm ci
+          bash -n rollback/scripts/rollback.sh
+          npm start
+          curl -f http://localhost:3000/health
+          ```
+          ## Rollback Checklist
+          - [ ] Download rollback package
+          - [ ] Verify SHA256 checksums
+          - [ ] Extract rollback package
+          - [ ] Restore package.json and package-lock.json
+          - [ ] Restore environment templates
+          - [ ] Run npm ci
+          - [ ] Validate rollback script
+          - [ ] Verify health endpoint
+          HEREDOC_DOC
+      - name: Compress rollback package
+        id: compress
+        run: |
+          cd rollback
+          tar -czf ../rollback-package-${CURRENT_SHA}.tar.gz *
+          cd ..
+      - name: Generate SHA256 checksum
+        id: checksum
+        run: |
+          CHECKSUM=$(sha256sum rollback-package-${CURRENT_SHA}.tar.gz | awk '{print $1}')
+          echo "checksum=${CHECKSUM}" >> $GITHUB_OUTPUT
+          echo "${CHECKSUM}  rollback-package-${CURRENT_SHA}.tar.gz" > rollback-package-${CURRENT_SHA}.sha256
+          cp rollback-package-${CURRENT_SHA}.sha256 rollback/rollback-package-${CURRENT_SHA}.sha256
+      - name: Validate rollback script
+        run: bash -n rollback/scripts/rollback.sh && echo "Rollback script syntax validation passed"
+      - name: Upload rollback artifacts
+        id: build-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-package-${CURRENT_SHA}
+          path: rollback
+          retention-days: 30
+      - name: Create and post rollback plan comment
+        id: create-comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const core = require('@actions/core');
+            const issueNumber = process.env.ISSUE_NUMBER || 'N/A';
+            const currentSha = process.env.CURRENT_SHA || 'N/A';
+            const previousSha = process.env.PREVIOUS_SHA || 'N/A';
+            const pkgVersion = process.env.PKG_VERSION || 'N/A';
+            const artifactChecksum = process.env.ARTIFACT_CHECKSUM || 'N/A';
+            const artifactName = `rollback-package-${currentSha}`;
+            const body = [
+              '🔄 Rollback Plan Ready',
+              '',
+              `Previous Commit: ${previousSha}`,
+              `Current Commit: ${currentSha}`,
+              `Package Version: ${pkgVersion}`,
+              `Artifact: ${artifactName}`,
+              '',
+              'Rollback components completed:',
+              '✅ Rollback script created and validated',
+              '✅ package.json backup completed',
+              '✅ package-lock.json backup completed',
+              '✅ Environment templates backed up',
+              '✅ Dependency verification script created',
+              '✅ Detailed rollback documentation completed',
+              '✅ Compressed rollback package created',
+              '✅ SHA256 checksums generated',
+              '',
+              'Quick Rollback Command:',
+              '',
+              '```bash',
+              '# Verify the rollback package checksum',
+              'sha256sum -c rollback-package-<sha>.sha256',
+              '',
+              '# Extract the rollback package',
+              'tar -xzvf rollback-package-<sha>.tar.gz',
+              '',
+              '# Restore Node.js dependencies',
+              'npm ci',
+              '',
+              '# Validate the rollback script',
+              'bash -n rollback/scripts/rollback.sh',
+              '```',
+              '',
+              'Script verification status: Rollback script created: true',
+              'Configuration backup: true',
+              '',
+              `SHA256: ${artifactChecksum}`,
+              '',
+              `Rollback artifact: ${artifactName} (stored for 30 days).`,
+            ].join('\n');
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body,
+              });
+              core.info(`Rollback plan comment posted on issue #${issueNumber}`);
+              core.setOutput('issue_number', issueNumber);
+            } catch (error) {
+              core.setFailed(`Failed to post rollback comment: ${error.message}`);
+            }
+  post-deployment:
+    runs-on: ubuntu-latest
+    needs: rollback-preparation
+    env:
+      ISSUE_NUMBER: ${{ needs.pre-deployment.outputs.issue_number }}
+      CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_sha }}
+      ARTIFACT_NAME: rollback-package-${{ needs.pre-deployment.outputs.current_sha }}
+      ARTIFACT_CHECKSUM: ${{ needs.rollback-preparation.outputs.artifact_sha256 }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - name: Download rollback artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ARTIFACT_NAME
+          path: artifacts/rollback-package
+      - name: Verify artifact checksum
+        id: verify-checksum
+        run: |
+          cd artifacts/rollback-package
+          CHECKSUM_FILE=$(ls -1 *.sha256 2>/dev/null | head -n 1)
+          if [[ -z "$CHECKSUM_FILE" ]; then echo "ERROR: checksum file not found"; exit 1; fi
+          if sha256sum -c "$CHECKSUM_FILE"; then echo "ARTIFACT_CHECKSUM_VERIFIED=true" >> $GITHUB_OUTPUT
+          else echo "Checksum verification failed"; exit 1; fi
+      - name: Update deployment issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const core = require('@actions/core';
+            const issueNumber = process.env.ISSUE_NUMBER || 'N/A';
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: 'in-progress',
+              });
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['completed'],
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed',
+              });
+              core.info(`Issue #${issueNumber} updated and closed.`);
+            } catch (error) {
+              core.setFailed(`Failed to update issue #${issueNumber}: ${error.message}`);
+            }
+      - name: Post final deployment comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const core = require('@actions/core';
+            const issueNumber = process.env.ISSUE_NUMBER || 'N/A';
+            const currentSha = process.env.CURRENT_SHA || 'N/A';
+            const artifactName = process.env.ARTIFACT_NAME || `rollback-package-${currentSha}`;
+            const artifactChecksum = process.env.ARTIFACT_CHECKSUM || 'N/A';
+            const body = [
+              'Deployment Completed Successfully',
+              '',
+              'Rollback artifact details:',
+              `- Artifact: ${artifactName}`,
+              `- SHA256 checksum: ${artifactChecksum}`,
+              `- Artifact retention: 30 days`,
+              `- Checksum verification: passed`,
+              '',
+              'Labels updated: in-progress removed, completed added.',
+              `Deployment tracking issue #${issueNumber} has been closed.
+            ].join('\n');
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body,
+              });
+              core.info(`Final comment posted on issue #${issueNumber}`);
+            } catch (error) {
+              core.setFailed(`Failed to post final comment: ${error.message}`);
+            }
