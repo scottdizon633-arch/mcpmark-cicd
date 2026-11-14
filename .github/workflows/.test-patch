@@ -1,1 +1,5 @@
-hello world
+--- a/.github/workflows/.test-patch
++++ b/.github/workflows/.test-patch
+@@ -1 +1 @@
+-hello world
++hello universe
