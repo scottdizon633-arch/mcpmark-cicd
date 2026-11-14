@@ -109,7 +109,7 @@ jobs:
     env:
       ISSUE_NUMBER: ${{ needs.pre-deployment.outputs.issue_number }}
       CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_sha }}
-      PREVIOUSSHA: ${{ needs.pre-deployment.outputs.previous_sha }}
+      PREVIOUS_SHA: ${{ needs.pre-deployment.outputs.previous_sha }}
       PKG_VERSION: ${{ needs.pre-deployment.outputs.pkg_version }}
       ARTIFACT_CHECKSUM: ${{ steps.checksum.outputs.checksum }}
     steps:
@@ -240,13 +240,13 @@ jobs:
           ## Step-by-Step Rollback Procedure
           1. **Locate the rollback package** — download `rollback-package-<sha>` from GitHub Actions artifacts.
           2. **Verify the checksum** — run `sha256sum -c rollback-package-<sha>.sha256`.
-          3. **Extract the package** — run `tar -xzvf rollback-package-<sha>.tar.gz`.
+          3. **Extract the package** — run `tar -xzvf rollback-package-<sha>.tar.gz.
           4. **Restore configuration backups** — copy `backups/package.json`, `backups/package-lock.json`, and `backups/env-templates/.env.example` into the application root.
           5. **Restore environment variables** — set NODE_ENV and PORT in `.env` from the environment template.
           6. **Restore dependencies** — run `npm ci` to reinstall the exact dependency versions.
-          7. **Validate the rollback script** — run `bash -n rollback/scripts/rollback.sh`.
-          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz`.
-          9. **Restart the application** — run `npm start`.
+          7. **Validate the rollback script** — run `bash -n rollback/scripts/rollback.sh.
+          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz.
+          9. **Restart the application** — run `npm start.
           10. **Verify the deployment** — call `curl -f http://localhost:3000/health` and confirm a 200 response.
           ## Quick Rollback Command
           ```bash
@@ -294,7 +294,7 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const core = require('@actions/core');
+            const core = require('@actions/core';
             const issueNumber = process.env.ISSUE_NUMBER || 'N/A';
             const currentSha = process.env.CURRENT_SHA || 'N/A';
             const previousSha = process.env.PREVIOUS_SHA || 'N/A';
@@ -438,6 +438,6 @@ jobs:
                 body: body,
               });
               core.info(`Final comment posted on issue #${issueNumber}`);
-            } catch (error)
-          core.setFailed(`Failed to post final comment: ${error.message}`);
+            } catch (error) {
+              core.setFailed(`Failed to post final comment: ${error.message}`);
             }
