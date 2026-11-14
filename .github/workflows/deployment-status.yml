@@ -125,7 +125,7 @@ jobs:
         id: capture
         run: |
           echo "CURRENT_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-          echo "PREVIOUS_SHA=$(git rev-parse HEAD^)" >> $GITHUB_OUTPUT
+          echo "PREVIOUSSHA=$(git rev-parse HEAD^)" >> $GITHUB_OUTPUT
           echo "PKG_VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
       - name: Create rollback artifact directory
         run: mkdir -p rollback/{backups,docs,scripts}
@@ -240,13 +240,13 @@ jobs:
           ## Step-by-Step Rollback Procedure
           1. **Locate the rollback package** — download `rollback-package-<sha>` from GitHub Actions artifacts.
           2. **Verify the checksum** — run `sha256sum -c rollback-package-<sha>.sha256`.
-          3. **Extract the package** — run `tar -xzvf rollback-package-<sha>.tar.gz.
+          3. **Extract the package** — run `tar -xzvf rollback-package-<sha>.tar.gz`.
           4. **Restore configuration backups** — copy `backups/package.json`, `backups/package-lock.json`, and `backups/env-templates/.env.example` into the application root.
           5. **Restore environment variables** — set NODE_ENV and PORT in `.env` from the environment template.
           6. **Restore dependencies** — run `npm ci` to reinstall the exact dependency versions.
-          7. **Validate the rollback script** — run `bash -n rollback/scripts/rollback.sh.
-          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz.
-          9. **Restart the application** — run `npm start.
+          7. **Validate the rollback script** — run `bash -n rollback/scripts/rollback.sh`.
+          8. **Run the rollback script** — execute `./rollback/scripts/rollback.sh rollback-package-<sha>.tar.gz`.
+          9. **Restart the application** — run `npm start`.
           10. **Verify the deployment** — call `curl -f http://localhost:3000/health` and confirm a 200 response.
           ## Quick Rollback Command
           ```bash
@@ -297,7 +297,7 @@ jobs:
             const core = require('@actions/core';
             const issueNumber = process.env.ISSUE_NUMBER || 'N/A';
             const currentSha = process.env.CURRENT_SHA || 'N/A';
-            const previousSha = process.env.PREVIOUS_SHA || 'N/A';
+            const previousSha = process.env.PREVIOUSSHA || 'N/A';
             const pkgVersion = process.env.PKG_VERSION || 'N/A';
             const artifactChecksum = process.env.ARTIFACT_CHECKSUM || 'N/A';
             const artifactName = `rollback-package-${currentSha}`;
@@ -377,7 +377,7 @@ jobs:
         run: |
           cd artifacts/rollback-package
           CHECKSUM_FILE=$(ls -1 *.sha256 2>/dev/null | head -n 1)
-          if [[ -z "$CHECKSUM_FILE" ]]; then echo "ERROR: checksum file not found"; exit 1; fi
+          if [[ -z "$CHECKSUM_FILE" ]; then echo "ERROR: checksum file not found"; exit 1; fi
           if sha256sum -c "$CHECKSUM_FILE"; then echo "ARTIFACT_CHECKSUM_VERIFIED=true" >> $GITHUB_OUTPUT
           else echo "Checksum verification failed"; exit 1; fi
       - name: Update deployment issue
